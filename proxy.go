@@ -31,6 +31,9 @@ type Proxy struct {
 
 	mu        sync.Mutex
 	frontends []*Frontend
+	// replayOrderMu serializes cache mutations with their frontend delivery.
+	// It stays separate from mu so a slow frontend cannot block agent input.
+	replayOrderMu sync.Mutex
 
 	nextID         atomic.Int64
 	pending        sync.Map // proxyID (int64) -> *PendingRequest
@@ -73,9 +76,19 @@ func (p *Proxy) touchSocket() {
 }
 
 func (p *Proxy) AddFrontend(f *Frontend) {
+	var replay [][]byte
+	p.replayOrderMu.Lock()
 	p.mu.Lock()
+	if !f.primary {
+		// Snapshot and register under the same ordering lock used by cached
+		// broadcasts. An update is therefore either in this replay or queued
+		// live for this frontend, never both and never neither.
+		f.beginReplay()
+		replay = p.cache.Snapshot()
+	}
 	p.frontends = append(p.frontends, f)
 	p.mu.Unlock()
+	p.replayOrderMu.Unlock()
 
 	// Start reading from this frontend
 	go f.ReadLines(p.fromFrontends)
@@ -89,7 +102,14 @@ func (p *Proxy) AddFrontend(f *Frontend) {
 	// Replay cached history for non-primary frontends.
 	// Run in a goroutine because Send may block on synchronous writers.
 	if !f.primary {
-		go p.cache.Replay(f)
+		go func() {
+			for _, line := range replay {
+				if !f.sendReplay(line) {
+					break
+				}
+			}
+			f.finishReplay()
+		}()
 	}
 }
 
@@ -132,6 +152,67 @@ func (p *Proxy) broadcastExcept(line []byte, except *Frontend) {
 	fes := make([]*Frontend, len(p.frontends))
 	copy(fes, p.frontends)
 	p.mu.Unlock()
+	p.sendToFrontends(fes, line, except)
+}
+
+// cacheAndBroadcast establishes one ordering point shared with AddFrontend and
+// every other cached broadcast. A replaying frontend queues Send immediately;
+// the dedicated ordering lock also keeps live delivery identical to cache
+// order for concurrent producers without blocking agent input behind a peer.
+func (p *Proxy) cacheAndBroadcast(line []byte, except *Frontend) {
+	p.replayOrderMu.Lock()
+	defer p.replayOrderMu.Unlock()
+	p.cacheAndBroadcastLocked(line, except)
+}
+
+// cacheAndBroadcastLocked requires replayOrderMu to be held.
+func (p *Proxy) cacheAndBroadcastLocked(line []byte, except *Frontend) {
+	p.cache.AddUpdate(line)
+	p.mu.Lock()
+	frontends := append([]*Frontend(nil), p.frontends...)
+	p.mu.Unlock()
+	p.sendToFrontends(frontends, line, except)
+}
+
+func (p *Proxy) cachePermissionAndBroadcast(line []byte) {
+	p.replayOrderMu.Lock()
+	defer p.replayOrderMu.Unlock()
+
+	p.cache.SetPendingPermission(line)
+	p.mu.Lock()
+	frontends := append([]*Frontend(nil), p.frontends...)
+	p.mu.Unlock()
+	p.sendToFrontends(frontends, line, nil)
+}
+
+// cacheSetupResponseAndBroadcastLocked records a replay-form initialize or
+// session/new response and delivers it to secondaries that attached before the
+// response arrived. AddFrontend uses the same lock, so each secondary receives
+// the response either in its snapshot or through this send, exactly once.
+// The caller must hold replayOrderMu.
+func (p *Proxy) cacheSetupResponseAndBroadcastLocked(method string, line []byte, requester *Frontend) {
+	switch method {
+	case "initialize":
+		p.cache.SetInitResponse(line)
+	case "session/new":
+		p.cache.SetNewResponse(line)
+	default:
+		return
+	}
+
+	p.mu.Lock()
+	var secondaries []*Frontend
+	for _, frontend := range p.frontends {
+		if frontend == requester || frontend.primary {
+			continue
+		}
+		secondaries = append(secondaries, frontend)
+	}
+	p.mu.Unlock()
+	p.sendToFrontends(secondaries, line, nil)
+}
+
+func (p *Proxy) sendToFrontends(fes []*Frontend, line []byte, except *Frontend) {
 
 	if Debug {
 		exceptID := -1
@@ -186,9 +267,10 @@ func (p *Proxy) readFromAgent() {
 			case KindNotification:
 				// session/update — fan out to all frontends and cache
 				if env.Method == "session/update" {
-					p.cache.AddUpdate(line)
+					p.cacheAndBroadcast(line, nil)
+				} else {
+					p.broadcast(line)
 				}
-				p.broadcast(line)
 
 			case KindResponse:
 				// Response to a request we forwarded. Look up who sent it.
@@ -256,30 +338,16 @@ func (p *Proxy) routeResponseToFrontend(env *Envelope, line []byte) {
 	}
 	pr := val.(*PendingRequest)
 
-	// Cache initialize and session/new responses
+	// Prepare a replay-form initialize or session/new response. It is cached
+	// after the requester receives its direct response so a slow secondary
+	// cannot hold up the request/response path.
+	var replayResponse []byte
 	switch pr.method {
-	case "initialize":
-		rewritten, err := rewriteID(line, 0) // doesn't matter, we'll rewrite per-frontend
-		if err == nil {
-			p.cache.SetInitResponse(rewritten)
-		}
-	case "session/new":
+	case "initialize", "session/new":
 		rewritten, err := rewriteID(line, 0)
 		if err == nil {
-			p.cache.SetNewResponse(rewritten)
+			replayResponse = rewritten
 		}
-	}
-
-	// For session/prompt responses, synthesize a turn-complete notification
-	// so other frontends know the agent finished (they don't get the response).
-	if pr.method == "session/prompt" {
-		p.synthesizeTurnComplete(line, pr.frontend)
-	}
-
-	// For session/set_mode responses, synthesize a current_mode_update
-	// notification so all other frontends (and the primary) learn about the change.
-	if pr.method == "session/set_mode" {
-		p.synthesizeModeChange(pr)
 	}
 
 	// Rewrite ID back to the frontend's original
@@ -291,7 +359,27 @@ func (p *Proxy) routeResponseToFrontend(env *Envelope, line []byte) {
 	if Debug {
 		log.Printf("send to frontend %d: %.100s", pr.frontend.id, string(rewritten))
 	}
+	orderedBoundary := replayResponse != nil || pr.method == "session/prompt" || pr.method == "session/set_mode"
+	if orderedBoundary {
+		// Keep the direct response and its cached setup/turn boundary atomic
+		// with respect to the requester's immediately following request.
+		p.replayOrderMu.Lock()
+		defer p.replayOrderMu.Unlock()
+	}
 	pr.frontend.Send(rewritten)
+
+	if replayResponse != nil {
+		p.cacheSetupResponseAndBroadcastLocked(pr.method, replayResponse, pr.frontend)
+	}
+
+	// Synthesize notifications only after delivering the direct response. Cached
+	// broadcasts are serialized, but a slow peer must not delay its requester.
+	if pr.method == "session/prompt" {
+		p.synthesizeTurnCompleteLocked(line, pr.frontend)
+	}
+	if pr.method == "session/set_mode" {
+		p.synthesizeModeChangeLocked(pr)
+	}
 }
 
 // routeReverseCall routes an agent-initiated request to the appropriate frontend(s).
@@ -307,9 +395,10 @@ func (p *Proxy) routeReverseCall(env *Envelope, line []byte) {
 	} else {
 		// Cache permission requests so late-joining frontends can respond
 		if env.Method == "session/request_permission" {
-			p.cache.SetPendingPermission(line)
+			p.cachePermissionAndBroadcast(line)
+		} else {
+			p.broadcast(line)
 		}
-		p.broadcast(line)
 	}
 }
 
@@ -450,8 +539,7 @@ func (p *Proxy) synthesizeUserMessage(env *Envelope, sender *Frontend) {
 			continue
 		}
 
-		p.cache.AddUpdate(line)
-		p.broadcastExcept(line, sender)
+		p.cacheAndBroadcast(line, sender)
 	}
 }
 
@@ -460,6 +548,13 @@ func (p *Proxy) synthesizeUserMessage(env *Envelope, sender *Frontend) {
 // the one that sent the prompt. This lets other frontends know the turn is over
 // (they only see streaming notifications, not the response).
 func (p *Proxy) synthesizeTurnComplete(responseLine []byte, sender *Frontend) {
+	p.replayOrderMu.Lock()
+	defer p.replayOrderMu.Unlock()
+	p.synthesizeTurnCompleteLocked(responseLine, sender)
+}
+
+// synthesizeTurnCompleteLocked requires replayOrderMu to be held.
+func (p *Proxy) synthesizeTurnCompleteLocked(responseLine []byte, sender *Frontend) {
 	var resp struct {
 		Result struct {
 			StopReason string `json:"stopReason"`
@@ -496,8 +591,7 @@ func (p *Proxy) synthesizeTurnComplete(responseLine []byte, sender *Frontend) {
 		return
 	}
 
-	p.cache.AddUpdate(line)
-	go p.broadcastExcept(line, sender)
+	p.cacheAndBroadcastLocked(line, sender)
 }
 
 // synthesizeModeChange broadcasts a current_mode_update notification to all
@@ -505,6 +599,13 @@ func (p *Proxy) synthesizeTurnComplete(responseLine []byte, sender *Frontend) {
 // this notification itself, so the proxy must synthesize it from the original
 // request params.
 func (p *Proxy) synthesizeModeChange(pr *PendingRequest) {
+	p.replayOrderMu.Lock()
+	defer p.replayOrderMu.Unlock()
+	p.synthesizeModeChangeLocked(pr)
+}
+
+// synthesizeModeChangeLocked requires replayOrderMu to be held.
+func (p *Proxy) synthesizeModeChangeLocked(pr *PendingRequest) {
 	var params struct {
 		SessionID string `json:"sessionId"`
 		ModeID    string `json:"modeId"`
@@ -532,8 +633,7 @@ func (p *Proxy) synthesizeModeChange(pr *PendingRequest) {
 		return
 	}
 
-	p.cache.AddUpdate(line)
-	go p.broadcastExcept(line, pr.frontend)
+	p.cacheAndBroadcastLocked(line, pr.frontend)
 }
 
 // restoreID replaces the "id" field with the original raw JSON value.

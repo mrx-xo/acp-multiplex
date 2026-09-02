@@ -7,9 +7,401 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+type blockingRecordingWriter struct {
+	mu           sync.Mutex
+	lines        []string
+	writes       int
+	firstStarted chan struct{}
+	releaseFirst chan struct{}
+	wrote        chan struct{}
+}
+
+func newBlockingRecordingWriter() *blockingRecordingWriter {
+	return &blockingRecordingWriter{
+		firstStarted: make(chan struct{}),
+		releaseFirst: make(chan struct{}),
+		wrote:        make(chan struct{}, 8),
+	}
+}
+
+func (w *blockingRecordingWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	w.writes++
+	first := w.writes == 1
+	w.mu.Unlock()
+	if first {
+		close(w.firstStarted)
+		<-w.releaseFirst
+	}
+	w.mu.Lock()
+	w.lines = append(w.lines, strings.TrimSpace(string(p)))
+	w.mu.Unlock()
+	w.wrote <- struct{}{}
+	return len(p), nil
+}
+
+func (w *blockingRecordingWriter) snapshot() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]string(nil), w.lines...)
+}
+
+func TestLateJoinerReceivesReplayBeforeLiveUpdateExactlyOnce(t *testing.T) {
+	cache := NewCache()
+	oldOne := []byte(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"old one"}}}}`)
+	oldTwo := []byte(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"tool-1","title":"old two"}}}`)
+	live := []byte(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_thought_chunk","messageId":"t1","content":{"type":"text","text":"live"}}}}`)
+	cache.AddUpdate(oldOne)
+	cache.AddUpdate(oldTwo)
+
+	proxy := NewProxy(io.Discard, strings.NewReader(""), cache)
+	frontendInput, frontendWriter := io.Pipe()
+	defer frontendWriter.Close()
+	writer := newBlockingRecordingWriter()
+	frontend := &Frontend{
+		id: 2, primary: false, scanner: bufio.NewScanner(frontendInput),
+		writer: writer, done: make(chan struct{}),
+	}
+	proxy.AddFrontend(frontend)
+
+	select {
+	case <-writer.firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replay never reached the blocked writer")
+	}
+
+	liveQueued := make(chan struct{})
+	go func() {
+		proxy.cacheAndBroadcast(live, nil)
+		close(liveQueued)
+	}()
+	select {
+	case <-liveQueued:
+	case <-time.After(2 * time.Second):
+		t.Fatal("live fan-out blocked behind replay instead of queueing")
+	}
+	close(writer.releaseFirst)
+
+	for range 3 {
+		select {
+		case <-writer.wrote:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("received only %d writes; want replay records followed by live record", len(writer.snapshot()))
+		}
+	}
+
+	got := writer.snapshot()
+	want := []string{string(oldOne), string(oldTwo), string(live)}
+	if len(got) != len(want) {
+		t.Fatalf("received %d records, want %d: %q", len(got), len(want), got)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("record %d = %s, want %s (all records: %q)", index, got[index], want[index], got)
+		}
+	}
+}
+
+func TestFrontendAttachedBeforeSetupResponseReceivesCachedResponse(t *testing.T) {
+	tests := []struct {
+		name        string
+		method      string
+		response    string
+		resultField string
+		resultValue interface{}
+	}{
+		{
+			name:        "initialize",
+			method:      "initialize",
+			response:    `{"jsonrpc":"2.0","id":900,"result":{"protocolVersion":1}}`,
+			resultField: "protocolVersion",
+			resultValue: float64(1),
+		},
+		{
+			name:        "session new",
+			method:      "session/new",
+			response:    `{"jsonrpc":"2.0","id":900,"result":{"sessionId":"s1"}}`,
+			resultField: "sessionId",
+			resultValue: "s1",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cache := NewCache()
+			proxy := NewProxy(io.Discard, strings.NewReader(""), cache)
+
+			frontendInput, frontendWriter := io.Pipe()
+			defer frontendWriter.Close()
+			writer := newBlockingRecordingWriter()
+			close(writer.releaseFirst)
+			secondary := &Frontend{
+				id: 2, primary: false, scanner: bufio.NewScanner(frontendInput),
+				writer: writer, done: make(chan struct{}),
+			}
+			proxy.AddFrontend(secondary)
+
+			requester := &Frontend{id: 1, primary: true, writer: io.Discard, done: make(chan struct{})}
+			proxy.pending.Store(int64(900), &PendingRequest{
+				originalID: json.RawMessage(`41`),
+				frontend:   requester,
+				method:     test.method,
+			})
+			line := []byte(test.response)
+			envelope, err := parseEnvelope(line)
+			if err != nil {
+				t.Fatal(err)
+			}
+			proxy.routeResponseToFrontend(envelope, line)
+
+			select {
+			case <-writer.wrote:
+			case <-time.After(300 * time.Millisecond):
+				t.Fatalf("frontend attached before %s response received no replay-form response", test.method)
+			}
+			lines := writer.snapshot()
+			if len(lines) != 1 {
+				t.Fatalf("received %d response records, want 1: %q", len(lines), lines)
+			}
+			var response map[string]interface{}
+			if err := json.Unmarshal([]byte(lines[0]), &response); err != nil {
+				t.Fatal(err)
+			}
+			if response["id"] != float64(0) {
+				t.Fatalf("replay-form response ID = %v, want 0", response["id"])
+			}
+			result := response["result"].(map[string]interface{})
+			if result[test.resultField] != test.resultValue {
+				t.Fatalf("result %s = %v, want %v", test.resultField, result[test.resultField], test.resultValue)
+			}
+		})
+	}
+}
+
+func TestReplayQueueOrderMatchesCacheOrderAcrossSyntheticBroadcast(t *testing.T) {
+	cache := NewCache()
+	old := []byte(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"old"}}}}`)
+	later := []byte(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_thought_chunk","messageId":"t1","content":{"type":"text","text":"later"}}}}`)
+	cache.AddUpdate(old)
+	proxy := NewProxy(io.Discard, strings.NewReader(""), cache)
+
+	sender := &Frontend{id: 1, primary: true, writer: io.Discard, done: make(chan struct{})}
+	blockedWriter := newBlockingRecordingWriter()
+	blocked := &Frontend{id: 2, writer: blockedWriter, done: make(chan struct{})}
+	proxy.frontends = append(proxy.frontends, sender, blocked)
+
+	targetInput, targetInputWriter := io.Pipe()
+	defer targetInputWriter.Close()
+	targetWriter := newBlockingRecordingWriter()
+	target := &Frontend{
+		id: 3, scanner: bufio.NewScanner(targetInput), writer: targetWriter,
+		done: make(chan struct{}),
+	}
+	proxy.AddFrontend(target)
+
+	var targetReleaseOnce sync.Once
+	var blockedReleaseOnce sync.Once
+	defer targetReleaseOnce.Do(func() { close(targetWriter.releaseFirst) })
+	defer blockedReleaseOnce.Do(func() { close(blockedWriter.releaseFirst) })
+
+	select {
+	case <-targetWriter.firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("target replay never reached the blocked writer")
+	}
+
+	turnDone := make(chan struct{})
+	go func() {
+		proxy.synthesizeTurnComplete([]byte(`{"jsonrpc":"2.0","id":9,"result":{"sessionId":"s1","stopReason":"end_turn"}}`), sender)
+		close(turnDone)
+	}()
+	select {
+	case <-blockedWriter.firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("synthetic turn-complete never reached the blocked frontend")
+	}
+	orderedWhileSending := !proxy.replayOrderMu.TryLock()
+	if !orderedWhileSending {
+		proxy.replayOrderMu.Unlock()
+	}
+
+	laterDone := make(chan struct{})
+	go func() {
+		proxy.cacheAndBroadcast(later, blocked)
+		close(laterDone)
+	}()
+
+	if !orderedWhileSending {
+		// The old split cache/send path releases the ordering lock before its
+		// deferred fan-out. Ensure the later record reaches the replay queue
+		// first so the regression is deterministic.
+		select {
+		case <-laterDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("later broadcast did not expose the unlocked ordering gap")
+		}
+	}
+	blockedReleaseOnce.Do(func() { close(blockedWriter.releaseFirst) })
+	for name, done := range map[string]<-chan struct{}{
+		"synthetic broadcast": turnDone,
+		"later broadcast":     laterDone,
+	} {
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s did not complete", name)
+		}
+	}
+
+	targetReleaseOnce.Do(func() { close(targetWriter.releaseFirst) })
+	for range 3 {
+		select {
+		case <-targetWriter.wrote:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("target received only %d records", len(targetWriter.snapshot()))
+		}
+	}
+
+	lines := targetWriter.snapshot()
+	if len(lines) != 3 {
+		t.Fatalf("target received %d records, want 3: %q", len(lines), lines)
+	}
+	wantKinds := []string{"user_message_chunk", "turn_complete", "agent_thought_chunk"}
+	for index, wantKind := range wantKinds {
+		kind, _, _ := parseUpdateType([]byte(lines[index]))
+		if kind != wantKind {
+			t.Fatalf("target record %d kind = %q, want %q (all records: %q)", index, kind, wantKind, lines)
+		}
+	}
+}
+
+func TestResponseBoundaryCannotBeOvertakenByNextCachedEvent(t *testing.T) {
+	tests := []struct {
+		name      string
+		method    string
+		response  string
+		wantKinds []string
+	}{
+		{
+			name:      "session new setup response",
+			method:    "session/new",
+			response:  `{"jsonrpc":"2.0","id":900,"result":{"sessionId":"s1"}}`,
+			wantKinds: []string{"setup_response", "user_message_chunk"},
+		},
+		{
+			name:      "prompt turn completion",
+			method:    "session/prompt",
+			response:  `{"jsonrpc":"2.0","id":900,"result":{"sessionId":"s1","stopReason":"end_turn"}}`,
+			wantKinds: []string{"turn_complete", "user_message_chunk"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cache := NewCache()
+			proxy := NewProxy(io.Discard, strings.NewReader(""), cache)
+
+			secondaryInput, secondaryInputWriter := io.Pipe()
+			defer secondaryInputWriter.Close()
+			secondaryWriter := newBlockingRecordingWriter()
+			close(secondaryWriter.releaseFirst)
+			secondary := &Frontend{
+				id: 2, scanner: bufio.NewScanner(secondaryInput), writer: secondaryWriter,
+				done: make(chan struct{}),
+			}
+			proxy.AddFrontend(secondary)
+
+			requesterWriter := newBlockingRecordingWriter()
+			var requesterReleaseOnce sync.Once
+			defer requesterReleaseOnce.Do(func() { close(requesterWriter.releaseFirst) })
+			requester := &Frontend{
+				id: 1, primary: true, writer: requesterWriter, done: make(chan struct{}),
+			}
+			proxy.pending.Store(int64(900), &PendingRequest{
+				originalID: json.RawMessage(`41`),
+				frontend:   requester,
+				method:     test.method,
+			})
+			responseLine := []byte(test.response)
+			envelope, err := parseEnvelope(responseLine)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			routeDone := make(chan struct{})
+			go func() {
+				proxy.routeResponseToFrontend(envelope, responseLine)
+				close(routeDone)
+			}()
+			select {
+			case <-requesterWriter.firstStarted:
+			case <-time.After(2 * time.Second):
+				t.Fatal("requester response never reached the blocked writer")
+			}
+
+			boundaryLocked := !proxy.replayOrderMu.TryLock()
+			if !boundaryLocked {
+				proxy.replayOrderMu.Unlock()
+			}
+			next := []byte(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"next"}}}}`)
+			nextDone := make(chan struct{})
+			go func() {
+				proxy.cacheAndBroadcast(next, requester)
+				close(nextDone)
+			}()
+			if !boundaryLocked {
+				select {
+				case <-nextDone:
+				case <-time.After(2 * time.Second):
+					t.Fatal("next event did not expose the unlocked response boundary")
+				}
+			}
+
+			requesterReleaseOnce.Do(func() { close(requesterWriter.releaseFirst) })
+			for name, done := range map[string]<-chan struct{}{
+				"response route": routeDone,
+				"next event":     nextDone,
+			} {
+				select {
+				case <-done:
+				case <-time.After(2 * time.Second):
+					t.Fatalf("%s did not complete", name)
+				}
+			}
+			for range 2 {
+				select {
+				case <-secondaryWriter.wrote:
+				case <-time.After(2 * time.Second):
+					t.Fatalf("secondary received only %d records", len(secondaryWriter.snapshot()))
+				}
+			}
+
+			lines := secondaryWriter.snapshot()
+			if len(lines) != len(test.wantKinds) {
+				t.Fatalf("secondary received %d records, want %d: %q", len(lines), len(test.wantKinds), lines)
+			}
+			for index, wantKind := range test.wantKinds {
+				var message map[string]interface{}
+				if err := json.Unmarshal([]byte(lines[index]), &message); err != nil {
+					t.Fatal(err)
+				}
+				gotKind := "setup_response"
+				if message["method"] == "session/update" {
+					gotKind, _, _ = parseUpdateType([]byte(lines[index]))
+				}
+				if gotKind != wantKind {
+					t.Fatalf("secondary record %d kind = %q, want %q (all records: %q)", index, gotKind, wantKind, lines)
+				}
+			}
+		})
+	}
+}
 
 // mockAgent simulates an ACP agent. It reads requests from its stdin,
 // responds to initialize and session/new, and echoes session/prompt
@@ -674,6 +1066,15 @@ func TestProxyIDRewriting(t *testing.T) {
 	json.Unmarshal(resp1, &r1)
 	if id, ok := r1["id"].(float64); !ok || int(id) != 1 {
 		t.Errorf("frontend 1: expected id=1, got %v", r1["id"])
+	}
+
+	// Frontend 2 was already attached, so it receives the replay-form
+	// initialize response that establishes the shared session state.
+	setup2 := readLine(t, fe2Scanner, 2*time.Second)
+	var setup map[string]interface{}
+	json.Unmarshal(setup2, &setup)
+	if id, ok := setup["id"].(float64); !ok || int(id) != 0 {
+		t.Fatalf("frontend 2: expected replay-form initialize id=0, got %v", setup["id"])
 	}
 
 	// Frontend 2 sends session/new also with id:1 (same ID space!)

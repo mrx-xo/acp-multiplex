@@ -11,21 +11,62 @@ import (
 
 // Frontend represents a connected ACP client.
 type Frontend struct {
-	id      int
-	primary bool
-	scanner *bufio.Scanner
-	writer  io.Writer
-	mu      sync.Mutex // protects writer
-	dead    bool       // set on first write error; skip further writes
-	done    chan struct{}
+	id        int
+	primary   bool
+	scanner   *bufio.Scanner
+	writer    io.Writer
+	mu        sync.Mutex // protects writer and dead
+	dead      bool       // set on first write error; skip further writes
+	replayMu  sync.Mutex // protects replaying and pending
+	replaying bool
+	pending   [][]byte // live records queued behind the replay high-water mark
+	done      chan struct{}
 }
 
 // Send writes a JSON line to this frontend. Thread-safe.
 // Returns false if the frontend is dead (write error occurred).
 func (f *Frontend) Send(line []byte) bool {
+	f.replayMu.Lock()
+	if f.replaying {
+		f.pending = append(f.pending, append([]byte(nil), line...))
+		f.replayMu.Unlock()
+		return true
+	}
+	f.replayMu.Unlock()
+	return f.sendSerialized(line)
+}
+
+func (f *Frontend) beginReplay() {
+	f.replayMu.Lock()
+	defer f.replayMu.Unlock()
+	f.replaying = true
+	f.pending = nil
+}
+
+func (f *Frontend) sendReplay(line []byte) bool {
+	return f.sendSerialized(line)
+}
+
+func (f *Frontend) finishReplay() {
+	f.replayMu.Lock()
+	defer f.replayMu.Unlock()
+	for _, line := range f.pending {
+		if !f.sendSerialized(line) {
+			break
+		}
+	}
+	f.pending = nil
+	f.replaying = false
+}
+
+func (f *Frontend) sendSerialized(line []byte) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.sendLocked(line)
+}
 
+// sendLocked writes one record while f.mu is held.
+func (f *Frontend) sendLocked(line []byte) bool {
 	if f.dead {
 		return false
 	}

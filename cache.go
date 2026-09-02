@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"math/big"
+	"reflect"
+	"strings"
 	"sync"
 )
 
@@ -21,14 +25,9 @@ type Cache struct {
 	pendingPermission []byte
 
 	// Accumulator for the current run of chunks
-	chunkType string // "agent_message_chunk" or "agent_thought_chunk", or ""
-	chunkText string
-	chunkMeta updateMeta // sessionId etc from first chunk in run
-}
-
-// updateMeta captures the envelope fields needed to reconstruct a coalesced notification.
-type updateMeta struct {
-	SessionID string `json:"sessionId"`
+	chunkType     string // "agent_message_chunk" or "agent_thought_chunk", or ""
+	chunkText     strings.Builder
+	chunkEnvelope map[string]interface{}
 }
 
 func NewCache() *Cache {
@@ -76,19 +75,24 @@ func (c *Cache) AddUpdate(line []byte) {
 	defer c.mu.Unlock()
 
 	// Parse the update type and content
-	kind, text, sessionID := parseUpdateType(line)
+	kind, text, _ := parseUpdateType(line)
+	envelope, _ := decodeJSONMap(line)
+	if !isEligibleTextChunk(envelope, kind) {
+		kind = ""
+	}
 
 	switch kind {
 	case "agent_message_chunk", "agent_thought_chunk":
-		if c.chunkType == kind {
-			// Same chunk type — accumulate
-			c.chunkText += text
+		if c.chunkType == kind &&
+			chunkEnvelopesEquivalent(c.chunkEnvelope, envelope) {
+			// Same logical text stream — accumulate.
+			c.chunkText.WriteString(text)
 		} else {
 			// Different type — flush previous, start new
 			c.flushChunks()
 			c.chunkType = kind
-			c.chunkText = text
-			c.chunkMeta = updateMeta{SessionID: sessionID}
+			c.chunkText.WriteString(text)
+			c.chunkEnvelope = envelope
 		}
 	default:
 		// Non-chunk update — flush any pending chunks, then store
@@ -104,66 +108,165 @@ func (c *Cache) flushChunks() {
 		return
 	}
 
-	notif := map[string]interface{}{
-		"jsonrpc": "2.0",
-		"method":  "session/update",
-		"params": map[string]interface{}{
-			"sessionId": c.chunkMeta.SessionID,
-			"update": map[string]interface{}{
-				"sessionUpdate": c.chunkType,
-				"content": map[string]string{
-					"type": "text",
-					"text": c.chunkText,
-				},
-			},
-		},
-	}
+	params, _ := c.chunkEnvelope["params"].(map[string]interface{})
+	update, _ := params["update"].(map[string]interface{})
+	content, _ := update["content"].(map[string]interface{})
+	content["text"] = c.chunkText.String()
 
-	if line, err := json.Marshal(notif); err == nil {
+	if line, err := json.Marshal(c.chunkEnvelope); err == nil {
 		c.updates = append(c.updates, line)
 	}
 
 	c.chunkType = ""
-	c.chunkText = ""
+	c.chunkText.Reset()
+	c.chunkEnvelope = nil
+}
+
+func decodeJSONMap(line []byte) (map[string]interface{}, error) {
+	decoder := json.NewDecoder(bytes.NewReader(line))
+	decoder.UseNumber()
+	var envelope map[string]interface{}
+	if err := decoder.Decode(&envelope); err != nil {
+		return nil, err
+	}
+	return envelope, nil
+}
+
+func isEligibleTextChunk(envelope map[string]interface{}, kind string) bool {
+	if kind != "agent_message_chunk" && kind != "agent_thought_chunk" {
+		return false
+	}
+	if method, _ := envelope["method"].(string); method != "session/update" {
+		return false
+	}
+	params, ok := envelope["params"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	sessionID, ok := params["sessionId"].(string)
+	if !ok || sessionID == "" {
+		return false
+	}
+	update, ok := params["update"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	updateKind, ok := update["sessionUpdate"].(string)
+	if !ok || updateKind != kind {
+		return false
+	}
+	if messageID, present := update["messageId"]; present {
+		messageIDString, ok := messageID.(string)
+		if !ok || messageIDString == "" {
+			return false
+		}
+	}
+	content, ok := update["content"].(map[string]interface{})
+	if !ok || content["type"] != "text" {
+		return false
+	}
+	_, ok = content["text"].(string)
+	return ok
+}
+
+func chunkEnvelopesEquivalent(first, next map[string]interface{}) bool {
+	return jsonValuesEquivalent(envelopeWithoutChunkText(first), envelopeWithoutChunkText(next))
+}
+
+func jsonValuesEquivalent(first, next interface{}) bool {
+	switch firstValue := first.(type) {
+	case map[string]interface{}:
+		nextValue, ok := next.(map[string]interface{})
+		if !ok || len(firstValue) != len(nextValue) {
+			return false
+		}
+		for key, firstChild := range firstValue {
+			nextChild, exists := nextValue[key]
+			if !exists || !jsonValuesEquivalent(firstChild, nextChild) {
+				return false
+			}
+		}
+		return true
+	case []interface{}:
+		nextValue, ok := next.([]interface{})
+		if !ok || len(firstValue) != len(nextValue) {
+			return false
+		}
+		for index := range firstValue {
+			if !jsonValuesEquivalent(firstValue[index], nextValue[index]) {
+				return false
+			}
+		}
+		return true
+	case json.Number:
+		nextValue, ok := next.(json.Number)
+		if !ok {
+			return false
+		}
+		firstNumber, firstOK := new(big.Rat).SetString(firstValue.String())
+		nextNumber, nextOK := new(big.Rat).SetString(nextValue.String())
+		if firstOK && nextOK {
+			return firstNumber.Cmp(nextNumber) == 0
+		}
+		return firstValue.String() == nextValue.String()
+	default:
+		return reflect.DeepEqual(first, next)
+	}
+}
+
+func envelopeWithoutChunkText(envelope map[string]interface{}) map[string]interface{} {
+	copyMap := func(source map[string]interface{}) map[string]interface{} {
+		result := make(map[string]interface{}, len(source))
+		for key, value := range source {
+			result[key] = value
+		}
+		return result
+	}
+
+	result := copyMap(envelope)
+	params, _ := envelope["params"].(map[string]interface{})
+	paramsCopy := copyMap(params)
+	result["params"] = paramsCopy
+	update, _ := params["update"].(map[string]interface{})
+	updateCopy := copyMap(update)
+	paramsCopy["update"] = updateCopy
+	content, _ := update["content"].(map[string]interface{})
+	contentCopy := copyMap(content)
+	delete(contentCopy, "text")
+	updateCopy["content"] = contentCopy
+	return result
+}
+
+// Snapshot returns the cached session history in replay order.
+func (c *Cache) Snapshot() [][]byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Flush any in-progress chunks so replay is complete
+	c.flushChunks()
+
+	lines := make([][]byte, 0, 3+len(c.updates)+1)
+	appendLine := func(line []byte) {
+		if line != nil {
+			lines = append(lines, append([]byte(nil), line...))
+		}
+	}
+	appendLine(c.meta)
+	appendLine(c.initResp)
+	appendLine(c.newResp)
+	for _, update := range c.updates {
+		appendLine(update)
+	}
+	appendLine(c.pendingPermission)
+	return lines
 }
 
 // Replay sends the cached session history to a frontend.
 func (c *Cache) Replay(f *Frontend) {
-	c.mu.Lock()
-	// Flush any in-progress chunks so replay is complete
-	c.flushChunks()
-
-	// Snapshot under lock
-	initResp := c.initResp
-	newResp := c.newResp
-	meta := c.meta
-	updates := make([][]byte, len(c.updates))
-	copy(updates, c.updates)
-	pendingPerm := c.pendingPermission
-	c.mu.Unlock()
-
-	if meta != nil {
-		if !f.Send(meta) {
+	for _, line := range c.Snapshot() {
+		if !f.Send(line) {
 			return
 		}
-	}
-	if initResp != nil {
-		if !f.Send(initResp) {
-			return
-		}
-	}
-	if newResp != nil {
-		if !f.Send(newResp) {
-			return
-		}
-	}
-	for _, u := range updates {
-		if !f.Send(u) {
-			return
-		}
-	}
-	if pendingPerm != nil {
-		f.Send(pendingPerm)
 	}
 }
 
