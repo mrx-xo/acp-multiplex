@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -218,7 +220,8 @@ func TestReplayQueueOrderMatchesCacheOrderAcrossSyntheticBroadcast(t *testing.T)
 
 	turnDone := make(chan struct{})
 	go func() {
-		proxy.synthesizeTurnComplete([]byte(`{"jsonrpc":"2.0","id":9,"result":{"sessionId":"s1","stopReason":"end_turn"}}`), sender)
+		proxy.synthesizeTurnComplete(&PendingRequest{frontend: sender, method: "session/prompt", sessionID: "s1"},
+			[]byte(`{"jsonrpc":"2.0","id":9,"result":{"sessionId":"s1","stopReason":"end_turn"}}`))
 		close(turnDone)
 	}()
 	select {
@@ -1281,4 +1284,217 @@ func TestPermissionReplayAfterTurnComplete(t *testing.T) {
 	}
 
 	w.Close()
+}
+
+// --- Turn closure: every matched prompt response ends its turn ---
+
+// recordingWriter keeps every line written to a frontend.
+type recordingWriter struct {
+	mu    sync.Mutex
+	lines [][]byte
+}
+
+func (w *recordingWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, l := range bytes.Split(bytes.TrimRight(p, "\n"), []byte("\n")) {
+		if len(l) > 0 {
+			w.lines = append(w.lines, append([]byte(nil), l...))
+		}
+	}
+	return len(p), nil
+}
+
+func (w *recordingWriter) snapshotLines() [][]byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([][]byte(nil), w.lines...)
+}
+
+// turnTestProxy returns a proxy whose agent stdin is drained, a recording
+// sender frontend, and a recording observer frontend.
+func turnTestProxy(t *testing.T) (*Proxy, *Frontend, *recordingWriter) {
+	t.Helper()
+	agentInR, agentInW := io.Pipe()
+	go io.Copy(io.Discard, agentInR)
+	t.Cleanup(func() { agentInW.Close() })
+	proxy := NewProxy(agentInW, bufio.NewReader(strings.NewReader("")), NewCache())
+	sender := &Frontend{id: 1, writer: &recordingWriter{}, done: make(chan struct{})}
+	observerW := &recordingWriter{}
+	observer := &Frontend{id: 2, writer: observerW, done: make(chan struct{})}
+	proxy.frontends = append(proxy.frontends, sender, observer)
+	return proxy, sender, observerW
+}
+
+func turnCompletes(lines [][]byte) []map[string]interface{} {
+	var out []map[string]interface{}
+	for _, l := range lines {
+		var m map[string]interface{}
+		if json.Unmarshal(l, &m) != nil {
+			continue
+		}
+		params, _ := m["params"].(map[string]interface{})
+		update, _ := params["update"].(map[string]interface{})
+		if update["sessionUpdate"] == "turn_complete" {
+			update["sessionId"] = params["sessionId"]
+			out = append(out, update)
+		}
+	}
+	return out
+}
+
+func promptEnvelope(t *testing.T, id int, session string) (*Envelope, []byte) {
+	t.Helper()
+	line := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"session/prompt","params":{"sessionId":%q,"prompt":[{"type":"text","text":"hi"}]}}`, id, session))
+	env, err := parseEnvelope(line)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return env, line
+}
+
+func responseEnvelope(t *testing.T, body string) (*Envelope, []byte) {
+	t.Helper()
+	line := []byte(body)
+	env, err := parseEnvelope(line)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return env, line
+}
+
+func TestErrorResponseClosesTurn(t *testing.T) {
+	proxy, sender, observer := turnTestProxy(t)
+	env, line := promptEnvelope(t, 3, "s1")
+	proxy.handleFrontendRequest(sender, env, line)
+	proxyID := proxy.nextID.Load() - 1
+	renv, rline := responseEnvelope(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"error":{"code":-32000,"message":"boom"}}`, proxyID))
+	proxy.routeResponseToFrontend(renv, rline)
+
+	tcs := turnCompletes(observer.snapshotLines())
+	if len(tcs) != 1 {
+		t.Fatalf("observer must see exactly one turn_complete after an error response, got %d: %s", len(tcs), observer.snapshotLines())
+	}
+	if tcs[0]["stopReason"] != "error" || tcs[0]["sessionId"] != "s1" {
+		t.Fatalf("turn_complete must carry stopReason error and the request's sessionId, got %v", tcs[0])
+	}
+	if got := turnCompletes(proxy.cache.Snapshot()); len(got) != 1 {
+		t.Fatalf("cache must hold the closing marker for late joiners, got %d", len(got))
+	}
+}
+
+func TestSuccessfulResponseTakesSessionFromRequest(t *testing.T) {
+	proxy, sender, observer := turnTestProxy(t)
+	env, line := promptEnvelope(t, 3, "s1")
+	proxy.handleFrontendRequest(sender, env, line)
+	proxyID := proxy.nextID.Load() - 1
+	renv, rline := responseEnvelope(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":{"stopReason":"end_turn"}}`, proxyID))
+	proxy.routeResponseToFrontend(renv, rline)
+	tcs := turnCompletes(observer.snapshotLines())
+	if len(tcs) != 1 || tcs[0]["sessionId"] != "s1" || tcs[0]["stopReason"] != "end_turn" {
+		t.Fatalf("turn_complete must name the request's session even when the response omits it, got %v", tcs)
+	}
+}
+
+func TestQueuedPromptKeepsTurnOpenUntilLastResponse(t *testing.T) {
+	proxy, sender, observer := turnTestProxy(t)
+	envA, lineA := promptEnvelope(t, 3, "s1")
+	proxy.handleFrontendRequest(sender, envA, lineA)
+	idA := proxy.nextID.Load() - 1
+	envB, lineB := promptEnvelope(t, 4, "s1")
+	proxy.handleFrontendRequest(sender, envB, lineB)
+	idB := proxy.nextID.Load() - 1
+
+	renvA, rlineA := responseEnvelope(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":{"stopReason":"end_turn"}}`, idA))
+	proxy.routeResponseToFrontend(renvA, rlineA)
+	if tcs := turnCompletes(observer.snapshotLines()); len(tcs) != 0 {
+		t.Fatalf("first response must not close the turn while prompt B is pending, got %v", tcs)
+	}
+	renvB, rlineB := responseEnvelope(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":{"stopReason":"end_turn"}}`, idB))
+	proxy.routeResponseToFrontend(renvB, rlineB)
+	if tcs := turnCompletes(observer.snapshotLines()); len(tcs) != 1 {
+		t.Fatalf("last response must close the turn exactly once, got %v", tcs)
+	}
+}
+
+func TestOtherSessionPromptDoesNotHoldTurnOpen(t *testing.T) {
+	proxy, sender, observer := turnTestProxy(t)
+	envA, lineA := promptEnvelope(t, 3, "s1")
+	proxy.handleFrontendRequest(sender, envA, lineA)
+	idA := proxy.nextID.Load() - 1
+	envB, lineB := promptEnvelope(t, 4, "s2")
+	proxy.handleFrontendRequest(sender, envB, lineB)
+	renvA, rlineA := responseEnvelope(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":{"stopReason":"end_turn"}}`, idA))
+	proxy.routeResponseToFrontend(renvA, rlineA)
+	tcs := turnCompletes(observer.snapshotLines())
+	if len(tcs) != 1 || tcs[0]["sessionId"] != "s1" {
+		t.Fatalf("a pending prompt on another session must not hold s1 open, got %v", tcs)
+	}
+}
+
+func TestAgentExitClosesPendingTurns(t *testing.T) {
+	agentInR, agentInW := io.Pipe()
+	go io.Copy(io.Discard, agentInR)
+	agentOutR, agentOutW := io.Pipe()
+	proxy := NewProxy(agentInW, agentOutR, NewCache())
+	sender := &Frontend{id: 1, writer: &recordingWriter{}, done: make(chan struct{})}
+	observerW := &recordingWriter{}
+	observer := &Frontend{id: 2, writer: observerW, done: make(chan struct{})}
+	proxy.frontends = append(proxy.frontends, sender, observer)
+
+	env, line := promptEnvelope(t, 3, "s1")
+	proxy.handleFrontendRequest(sender, env, line)
+
+	done := make(chan struct{})
+	go func() { proxy.readFromAgent(); close(done) }()
+	agentOutW.Close() // agent exits mid-turn
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("readFromAgent did not return after agent EOF")
+	}
+	tcs := turnCompletes(observerW.snapshotLines())
+	if len(tcs) != 1 || tcs[0]["stopReason"] != "error" || tcs[0]["sessionId"] != "s1" {
+		t.Fatalf("agent exit must close the open turn for observers, got %v", tcs)
+	}
+}
+
+func TestRejectedQueuedPromptDoesNotCloseRunningTurn(t *testing.T) {
+	proxy, sender, observer := turnTestProxy(t)
+	envA, lineA := promptEnvelope(t, 3, "s1")
+	proxy.handleFrontendRequest(sender, envA, lineA)
+	idA := proxy.nextID.Load() - 1
+	envB, lineB := promptEnvelope(t, 4, "s1")
+	proxy.handleFrontendRequest(sender, envB, lineB)
+	idB := proxy.nextID.Load() - 1
+
+	// The agent rejects the queued B while A is still running.
+	renvB, rlineB := responseEnvelope(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"error":{"code":-32000,"message":"busy"}}`, idB))
+	proxy.routeResponseToFrontend(renvB, rlineB)
+	if tcs := turnCompletes(observer.snapshotLines()); len(tcs) != 0 {
+		t.Fatalf("B's rejection must not close A's running turn, got %v", tcs)
+	}
+	renvA, rlineA := responseEnvelope(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":{"stopReason":"end_turn"}}`, idA))
+	proxy.routeResponseToFrontend(renvA, rlineA)
+	tcs := turnCompletes(observer.snapshotLines())
+	if len(tcs) != 1 || tcs[0]["stopReason"] != "end_turn" {
+		t.Fatalf("A's completion must close the turn once, got %v", tcs)
+	}
+}
+
+func TestFinalizeIsExclusive(t *testing.T) {
+	proxy, sender, observer := turnTestProxy(t)
+	env, line := promptEnvelope(t, 3, "s1")
+	proxy.handleFrontendRequest(sender, env, line)
+	proxyID := proxy.nextID.Load() - 1
+	errResp := []byte(`{"jsonrpc":"2.0","id":3,"error":{"code":-32603,"message":"Agent process exited"}}`)
+	val, _ := proxy.pending.Load(proxyID)
+	pr := val.(*PendingRequest)
+	// Drain and a late response for the same request: exactly one close.
+	proxy.failPendingRequest(proxyID, pr, errResp)
+	renv, rline := responseEnvelope(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":{"stopReason":"end_turn"}}`, proxyID))
+	proxy.routeResponseToFrontend(renv, rline)
+	if tcs := turnCompletes(observer.snapshotLines()); len(tcs) != 1 {
+		t.Fatalf("a request must be finalized exactly once, got %d closes", len(tcs))
+	}
 }

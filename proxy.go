@@ -21,6 +21,7 @@ type PendingRequest struct {
 	frontend   *Frontend
 	method     string          // for cache decisions
 	params     json.RawMessage // original params (for synthesizing notifications)
+	sessionID  string          // params.sessionId for session/prompt, else ""
 }
 
 // Proxy is the core multiplexer. It reads from the agent and fans out
@@ -299,7 +300,6 @@ func (p *Proxy) readFromAgent() {
 	p.pending.Range(func(key, value interface{}) bool {
 		proxyID := key.(int64)
 		pr := value.(*PendingRequest)
-		p.pending.Delete(proxyID)
 
 		errResp, _ := json.Marshal(map[string]interface{}{
 			"jsonrpc": "2.0",
@@ -311,9 +311,26 @@ func (p *Proxy) readFromAgent() {
 		})
 		log.Printf("sending error response for pending request %d (method %s) to frontend %d",
 			proxyID, pr.method, pr.frontend.id)
-		pr.frontend.Send(errResp)
+		p.failPendingRequest(proxyID, pr, errResp)
 		return true
 	})
+}
+
+// failPendingRequest answers PR with errResp on behalf of a dead agent and,
+// for a prompt, closes the turn its synthetic user chunk opened. Claiming
+// the request and deciding the close happen under the ordering lock so the
+// exit drain, a failed forward, and a late agent response cannot finalize
+// the same request twice or both see the other's prompt as still pending.
+func (p *Proxy) failPendingRequest(proxyID int64, pr *PendingRequest, errResp []byte) {
+	p.replayOrderMu.Lock()
+	defer p.replayOrderMu.Unlock()
+	if _, owned := p.pending.LoadAndDelete(proxyID); !owned {
+		return
+	}
+	pr.frontend.Send(errResp)
+	if pr.method == "session/prompt" {
+		p.synthesizeTurnCompleteLocked(pr, errResp)
+	}
 }
 
 // routeResponseToFrontend routes an agent response back to the
@@ -331,7 +348,7 @@ func (p *Proxy) routeResponseToFrontend(env *Envelope, line []byte) {
 		return
 	}
 
-	val, ok := p.pending.LoadAndDelete(proxyID)
+	val, ok := p.pending.Load(proxyID)
 	if !ok {
 		log.Printf("agent response for unknown id %d", proxyID)
 		return
@@ -366,6 +383,11 @@ func (p *Proxy) routeResponseToFrontend(env *Envelope, line []byte) {
 		p.replayOrderMu.Lock()
 		defer p.replayOrderMu.Unlock()
 	}
+	// Claim the request under the ordering lock: the agent-exit drain and a
+	// failed forward finalize requests too, and exactly one path may.
+	if _, owned := p.pending.LoadAndDelete(proxyID); !owned {
+		return
+	}
 	pr.frontend.Send(rewritten)
 
 	if replayResponse != nil {
@@ -375,7 +397,7 @@ func (p *Proxy) routeResponseToFrontend(env *Envelope, line []byte) {
 	// Synthesize notifications only after delivering the direct response. Cached
 	// broadcasts are serialized, but a slow peer must not delay its requester.
 	if pr.method == "session/prompt" {
-		p.synthesizeTurnCompleteLocked(line, pr.frontend)
+		p.synthesizeTurnCompleteLocked(pr, line)
 	}
 	if pr.method == "session/set_mode" {
 		p.synthesizeModeChangeLocked(pr)
@@ -469,12 +491,21 @@ func (p *Proxy) handleFrontendRequest(f *Frontend, env *Envelope, line []byte) {
 	if env.ID != nil {
 		origID = append(json.RawMessage(nil), *env.ID...)
 	}
-	p.pending.Store(proxyID, &PendingRequest{
+	pr := &PendingRequest{
 		originalID: origID,
 		frontend:   f,
 		method:     env.Method,
 		params:     env.Params,
-	})
+	}
+	if env.Method == "session/prompt" {
+		var params struct {
+			SessionID string `json:"sessionId"`
+		}
+		if json.Unmarshal(env.Params, &params) == nil {
+			pr.sessionID = params.SessionID
+		}
+	}
+	p.pending.Store(proxyID, pr)
 
 	// Rewrite ID and forward
 	rewritten, err := rewriteID(line, proxyID)
@@ -492,7 +523,6 @@ func (p *Proxy) handleFrontendRequest(f *Frontend, env *Envelope, line []byte) {
 
 	if err := p.sendToAgent(rewritten); err != nil {
 		log.Printf("frontend %d: send to agent failed: %v", f.id, err)
-		p.pending.Delete(proxyID)
 		errResp, _ := json.Marshal(map[string]interface{}{
 			"jsonrpc": "2.0",
 			"id":      origID,
@@ -501,7 +531,7 @@ func (p *Proxy) handleFrontendRequest(f *Frontend, env *Envelope, line []byte) {
 				"message": "Agent process exited",
 			},
 		})
-		f.Send(errResp)
+		p.failPendingRequest(proxyID, pr, errResp)
 		return
 	}
 }
@@ -543,35 +573,69 @@ func (p *Proxy) synthesizeUserMessage(env *Envelope, sender *Frontend) {
 	}
 }
 
-// synthesizeTurnComplete extracts the stopReason from a session/prompt response
-// and broadcasts a synthetic session/update notification to all frontends except
-// the one that sent the prompt. This lets other frontends know the turn is over
-// (they only see streaming notifications, not the response).
-func (p *Proxy) synthesizeTurnComplete(responseLine []byte, sender *Frontend) {
+// synthesizeTurnComplete closes the turn that a session/prompt request PR
+// opened, given the response (result or error) the agent gave it. It
+// broadcasts a synthetic session/update notification to all frontends
+// except the one that sent the prompt, so frontends that only see the
+// streaming notifications (not the direct response) know the turn ended.
+//
+// Every matched prompt response closes, including errors and the drain on
+// agent exit: consumers key busy/idle off these markers, and an opening
+// with no close left them stuck on "generating". The close is skipped
+// while another prompt for the same session is still pending (Claude Code
+// queues prompts), so one open/close pair spans the whole run.
+func (p *Proxy) synthesizeTurnComplete(pr *PendingRequest, responseLine []byte) {
 	p.replayOrderMu.Lock()
 	defer p.replayOrderMu.Unlock()
-	p.synthesizeTurnCompleteLocked(responseLine, sender)
+	p.synthesizeTurnCompleteLocked(pr, responseLine)
+}
+
+// otherPromptPending reports whether a session/prompt other than the one
+// already removed from pending is still outstanding for sessionID.
+func (p *Proxy) otherPromptPending(sessionID string) bool {
+	found := false
+	p.pending.Range(func(_, value interface{}) bool {
+		other := value.(*PendingRequest)
+		if other.method == "session/prompt" && other.sessionID == sessionID {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 // synthesizeTurnCompleteLocked requires replayOrderMu to be held.
-func (p *Proxy) synthesizeTurnCompleteLocked(responseLine []byte, sender *Frontend) {
+func (p *Proxy) synthesizeTurnCompleteLocked(pr *PendingRequest, responseLine []byte) {
 	var resp struct {
-		Result struct {
+		Result *struct {
 			StopReason string `json:"stopReason"`
 			SessionID  string `json:"sessionId"`
 		} `json:"result"`
+		Error *json.RawMessage `json:"error"`
 	}
 	if err := json.Unmarshal(responseLine, &resp); err != nil {
 		return
 	}
 
-	stopReason := resp.Result.StopReason
-	if stopReason == "" {
-		return
+	// The request names the session; the agent's response usually does not.
+	sessionID := pr.sessionID
+	if sessionID == "" && resp.Result != nil {
+		sessionID = resp.Result.SessionID
 	}
 
-	// Try to get sessionId from the response; fall back to empty
-	sessionID := resp.Result.SessionID
+	stopReason := "unknown"
+	switch {
+	case resp.Error != nil:
+		stopReason = "error"
+	case resp.Result != nil && resp.Result.StopReason != "":
+		stopReason = resp.Result.StopReason
+	}
+
+	if p.otherPromptPending(sessionID) {
+		return
+	}
+	sender := pr.frontend
 
 	notif := map[string]interface{}{
 		"jsonrpc": "2.0",
