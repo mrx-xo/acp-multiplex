@@ -90,16 +90,22 @@ func TestLateJoinerReceivesReplayBeforeLiveUpdateExactlyOnce(t *testing.T) {
 	}
 	close(writer.releaseFirst)
 
-	for range 3 {
+	for range 5 {
 		select {
 		case <-writer.wrote:
 		case <-time.After(2 * time.Second):
-			t.Fatalf("received only %d writes; want replay records followed by live record", len(writer.snapshot()))
+			t.Fatalf("received only %d writes; want replay boundaries, replay records, then live record", len(writer.snapshot()))
 		}
 	}
 
 	got := writer.snapshot()
-	want := []string{string(oldOne), string(oldTwo), string(live)}
+	want := []string{
+		`{"jsonrpc":"2.0","method":"acp-multiplex/replay_start"}`,
+		string(oldOne),
+		string(oldTwo),
+		`{"jsonrpc":"2.0","method":"acp-multiplex/replay_complete"}`,
+		string(live),
+	}
 	if len(got) != len(want) {
 		t.Fatalf("received %d records, want %d: %q", len(got), len(want), got)
 	}
@@ -107,6 +113,63 @@ func TestLateJoinerReceivesReplayBeforeLiveUpdateExactlyOnce(t *testing.T) {
 		if got[index] != want[index] {
 			t.Fatalf("record %d = %s, want %s (all records: %q)", index, got[index], want[index], got)
 		}
+	}
+}
+
+func TestSecondaryReceivesReplayBoundariesWithEmptyHistory(t *testing.T) {
+	cache := NewCache()
+	proxy := NewProxy(io.Discard, strings.NewReader(""), cache)
+
+	frontendInput, frontendInputWriter := io.Pipe()
+	defer frontendInputWriter.Close()
+	writer := newBlockingRecordingWriter()
+	close(writer.releaseFirst)
+	secondary := &Frontend{
+		id: 2, scanner: bufio.NewScanner(frontendInput), writer: writer,
+		done: make(chan struct{}),
+	}
+	proxy.AddFrontend(secondary)
+
+	for range 2 {
+		select {
+		case <-writer.wrote:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("received only %d replay boundary records", len(writer.snapshot()))
+		}
+	}
+
+	got := writer.snapshot()
+	want := []string{
+		`{"jsonrpc":"2.0","method":"acp-multiplex/replay_start"}`,
+		`{"jsonrpc":"2.0","method":"acp-multiplex/replay_complete"}`,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("received %d records, want %d: %q", len(got), len(want), got)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("record %d = %s, want %s", index, got[index], want[index])
+		}
+	}
+	if replay := cache.Snapshot(); len(replay) != 0 {
+		t.Fatalf("replay markers entered cache: %q", replay)
+	}
+}
+
+func TestPrimaryDoesNotReceiveReplayBoundaries(t *testing.T) {
+	cache := NewCache()
+	proxy := NewProxy(io.Discard, strings.NewReader(""), cache)
+	writer := newBlockingRecordingWriter()
+	close(writer.releaseFirst)
+	primary := &Frontend{
+		id: 1, primary: true, scanner: bufio.NewScanner(strings.NewReader("")),
+		writer: writer, done: make(chan struct{}),
+	}
+
+	proxy.AddFrontend(primary)
+
+	if got := writer.snapshot(); len(got) != 0 {
+		t.Fatalf("primary received replay boundary records: %q", got)
 	}
 }
 
@@ -168,11 +231,13 @@ func TestFrontendAttachedBeforeSetupResponseReceivesCachedResponse(t *testing.T)
 				t.Fatalf("frontend attached before %s response received no replay-form response", test.method)
 			}
 			lines := writer.snapshot()
-			if len(lines) != 1 {
-				t.Fatalf("received %d response records, want 1: %q", len(lines), lines)
+			if len(lines) != 3 {
+				t.Fatalf("received %d records, want replay boundaries then response: %q", len(lines), lines)
 			}
+			assertReplayNotification(t, []byte(lines[0]), "acp-multiplex/replay_start")
+			assertReplayNotification(t, []byte(lines[1]), "acp-multiplex/replay_complete")
 			var response map[string]interface{}
-			if err := json.Unmarshal([]byte(lines[0]), &response); err != nil {
+			if err := json.Unmarshal([]byte(lines[2]), &response); err != nil {
 				t.Fatal(err)
 			}
 			if response["id"] != float64(0) {
@@ -263,7 +328,7 @@ func TestReplayQueueOrderMatchesCacheOrderAcrossSyntheticBroadcast(t *testing.T)
 	}
 
 	targetReleaseOnce.Do(func() { close(targetWriter.releaseFirst) })
-	for range 3 {
+	for range 5 {
 		select {
 		case <-targetWriter.wrote:
 		case <-time.After(2 * time.Second):
@@ -272,14 +337,17 @@ func TestReplayQueueOrderMatchesCacheOrderAcrossSyntheticBroadcast(t *testing.T)
 	}
 
 	lines := targetWriter.snapshot()
-	if len(lines) != 3 {
-		t.Fatalf("target received %d records, want 3: %q", len(lines), lines)
+	if len(lines) != 5 {
+		t.Fatalf("target received %d records, want 5: %q", len(lines), lines)
 	}
+	assertReplayNotification(t, []byte(lines[0]), "acp-multiplex/replay_start")
+	assertReplayNotification(t, []byte(lines[2]), "acp-multiplex/replay_complete")
 	wantKinds := []string{"user_message_chunk", "turn_complete", "agent_thought_chunk"}
 	for index, wantKind := range wantKinds {
-		kind, _, _ := parseUpdateType([]byte(lines[index]))
+		lineIndex := []int{1, 3, 4}[index]
+		kind, _, _ := parseUpdateType([]byte(lines[lineIndex]))
 		if kind != wantKind {
-			t.Fatalf("target record %d kind = %q, want %q (all records: %q)", index, kind, wantKind, lines)
+			t.Fatalf("target record %d kind = %q, want %q (all records: %q)", lineIndex, kind, wantKind, lines)
 		}
 	}
 }
@@ -377,7 +445,7 @@ func TestResponseBoundaryCannotBeOvertakenByNextCachedEvent(t *testing.T) {
 					t.Fatalf("%s did not complete", name)
 				}
 			}
-			for range 2 {
+			for range 4 {
 				select {
 				case <-secondaryWriter.wrote:
 				case <-time.After(2 * time.Second):
@@ -386,20 +454,23 @@ func TestResponseBoundaryCannotBeOvertakenByNextCachedEvent(t *testing.T) {
 			}
 
 			lines := secondaryWriter.snapshot()
-			if len(lines) != len(test.wantKinds) {
-				t.Fatalf("secondary received %d records, want %d: %q", len(lines), len(test.wantKinds), lines)
+			if len(lines) != len(test.wantKinds)+2 {
+				t.Fatalf("secondary received %d records, want %d: %q", len(lines), len(test.wantKinds)+2, lines)
 			}
+			assertReplayNotification(t, []byte(lines[0]), "acp-multiplex/replay_start")
+			assertReplayNotification(t, []byte(lines[1]), "acp-multiplex/replay_complete")
 			for index, wantKind := range test.wantKinds {
+				lineIndex := index + 2
 				var message map[string]interface{}
-				if err := json.Unmarshal([]byte(lines[index]), &message); err != nil {
+				if err := json.Unmarshal([]byte(lines[lineIndex]), &message); err != nil {
 					t.Fatal(err)
 				}
 				gotKind := "setup_response"
 				if message["method"] == "session/update" {
-					gotKind, _, _ = parseUpdateType([]byte(lines[index]))
+					gotKind, _, _ = parseUpdateType([]byte(lines[lineIndex]))
 				}
 				if gotKind != wantKind {
-					t.Fatalf("secondary record %d kind = %q, want %q (all records: %q)", index, gotKind, wantKind, lines)
+					t.Fatalf("secondary record %d kind = %q, want %q (all records: %q)", lineIndex, gotKind, wantKind, lines)
 				}
 			}
 		})
@@ -517,6 +588,25 @@ func readLine(t *testing.T, scanner *bufio.Scanner, timeout time.Duration) []byt
 	}
 }
 
+func readReplayNotification(t *testing.T, scanner *bufio.Scanner, method string) {
+	t.Helper()
+	assertReplayNotification(t, readLine(t, scanner, 2*time.Second), method)
+}
+
+func assertReplayNotification(t *testing.T, line []byte, method string) {
+	t.Helper()
+	var message map[string]interface{}
+	if err := json.Unmarshal(line, &message); err != nil {
+		t.Fatalf("decode %s notification: %v", method, err)
+	}
+	if message["jsonrpc"] != "2.0" || message["method"] != method {
+		t.Fatalf("got %s, want JSON-RPC notification %s", line, method)
+	}
+	if _, hasID := message["id"]; hasID {
+		t.Fatalf("%s must be a notification without id: %s", method, line)
+	}
+}
+
 func TestProxyFanOut(t *testing.T) {
 	// Create pipes for mock agent
 	agentInR, agentInW := io.Pipe()
@@ -587,8 +677,10 @@ func TestProxyFanOut(t *testing.T) {
 	proxy.AddFrontend(f2)
 
 	// Frontend 2 should get replayed init and session/new responses
+	readReplayNotification(t, fe2Scanner, "acp-multiplex/replay_start")
 	replayLine1 := readLine(t, fe2Scanner, 2*time.Second)
 	replayLine2 := readLine(t, fe2Scanner, 2*time.Second)
+	readReplayNotification(t, fe2Scanner, "acp-multiplex/replay_complete")
 	t.Logf("replay 1: %s", replayLine1)
 	t.Logf("replay 2: %s", replayLine2)
 
@@ -701,8 +793,10 @@ func TestModeChangeSynthesis(t *testing.T) {
 
 	// Now add frontend 2 — it gets replayed init + session/new
 	proxy.AddFrontend(f2)
+	readReplayNotification(t, fe2Scanner, "acp-multiplex/replay_start")
 	readLine(t, fe2Scanner, 2*time.Second) // replayed init
 	readLine(t, fe2Scanner, 2*time.Second) // replayed session/new
+	readReplayNotification(t, fe2Scanner, "acp-multiplex/replay_complete")
 
 	// Frontend 2 sends session/set_mode (like acp-mobile changing mode)
 	fe2W.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"session/set_mode","params":{"sessionId":"test-session-1","modeId":"plan"}}` + "\n"))
@@ -792,6 +886,7 @@ func TestBufferNameReplay(t *testing.T) {
 	f2.scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	proxy.AddFrontend(f2)
 
+	readReplayNotification(t, fe2Scanner, "acp-multiplex/replay_start")
 	// First replay message should be the meta notification
 	metaLine := readLine(t, fe2Scanner, 2*time.Second)
 	var m map[string]interface{}
@@ -819,6 +914,7 @@ func TestBufferNameReplay(t *testing.T) {
 	if nr["result"] == nil {
 		t.Errorf("expected session/new response, got: %s", newLine)
 	}
+	readReplayNotification(t, fe2Scanner, "acp-multiplex/replay_complete")
 }
 
 func TestModeChangeReplayedToLateJoiner(t *testing.T) {
@@ -894,6 +990,7 @@ func TestModeChangeReplayedToLateJoiner(t *testing.T) {
 	f3.scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	proxy.AddFrontend(f3)
 
+	readReplayNotification(t, fe3Scanner, "acp-multiplex/replay_start")
 	// Drain replay: init, session/new, then the mode update
 	readLine(t, fe3Scanner, 2*time.Second) // init
 	readLine(t, fe3Scanner, 2*time.Second) // session/new
@@ -912,6 +1009,7 @@ func TestModeChangeReplayedToLateJoiner(t *testing.T) {
 	if update["currentModeId"] != "plan" {
 		t.Errorf("expected modeId 'plan' in replay, got %v", update["currentModeId"])
 	}
+	readReplayNotification(t, fe3Scanner, "acp-multiplex/replay_complete")
 }
 
 func TestPermissionReplayedToLateJoiner(t *testing.T) {
@@ -1005,6 +1103,7 @@ func TestPermissionReplayedToLateJoiner(t *testing.T) {
 	f2.scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	proxy.AddFrontend(f2)
 
+	readReplayNotification(t, fe2Scanner, "acp-multiplex/replay_start")
 	// Drain replay: init response, then the pending permission
 	readLine(t, fe2Scanner, 2*time.Second) // init response
 
@@ -1019,6 +1118,7 @@ func TestPermissionReplayedToLateJoiner(t *testing.T) {
 	if tc["title"] != "Ready to code?" {
 		t.Errorf("expected title 'Ready to code?', got %v", tc["title"])
 	}
+	readReplayNotification(t, fe2Scanner, "acp-multiplex/replay_complete")
 }
 
 func TestProxyIDRewriting(t *testing.T) {
@@ -1060,6 +1160,8 @@ func TestProxyIDRewriting(t *testing.T) {
 	proxy.AddFrontend(f1)
 	proxy.AddFrontend(f2)
 	go proxy.Run()
+	readReplayNotification(t, fe2Scanner, "acp-multiplex/replay_start")
+	readReplayNotification(t, fe2Scanner, "acp-multiplex/replay_complete")
 
 	// Frontend 1 sends initialize with id:1
 	fe1W.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}` + "\n"))

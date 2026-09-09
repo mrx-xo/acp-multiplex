@@ -14,6 +14,11 @@ import (
 	"time"
 )
 
+var (
+	replayStartNotification    = []byte(`{"jsonrpc":"2.0","method":"acp-multiplex/replay_start"}`)
+	replayCompleteNotification = []byte(`{"jsonrpc":"2.0","method":"acp-multiplex/replay_complete"}`)
+)
+
 // PendingRequest tracks a request forwarded to the agent so we can
 // route the response back to the correct frontend with the correct ID.
 type PendingRequest struct {
@@ -104,9 +109,16 @@ func (p *Proxy) AddFrontend(f *Frontend) {
 	// Run in a goroutine because Send may block on synchronous writers.
 	if !f.primary {
 		go func() {
-			for _, line := range replay {
-				if !f.sendReplay(line) {
-					break
+			if f.sendReplay(replayStartNotification) {
+				replayComplete := true
+				for _, line := range replay {
+					if !f.sendReplay(line) {
+						replayComplete = false
+						break
+					}
+				}
+				if replayComplete {
+					f.sendReplay(replayCompleteNotification)
 				}
 			}
 			f.finishReplay()
