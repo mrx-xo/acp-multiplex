@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 var Debug bool
@@ -81,6 +82,14 @@ func runProxy() {
 
 	proxy := NewProxy(agentIn, agentOut, cache)
 	proxy.sockPath = socketPath()
+	// Without this, an editor that crashes leaves us and the agent running
+	// forever, still listed as a live session. EOF on the agent's stdin asks
+	// it to exit cleanly; cmd.Wait below then tears the socket down.
+	proxy.onPrimaryGone = func() {
+		log.Printf("primary frontend gone; shutting the agent down")
+		agentIn.Close()
+		time.AfterFunc(5*time.Second, func() { cmd.Process.Kill() })
+	}
 
 	// Primary frontend on stdin/stdout
 	primary := NewStdioFrontend(0)

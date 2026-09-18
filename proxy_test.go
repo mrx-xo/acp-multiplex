@@ -1600,3 +1600,52 @@ func TestFinalizeIsExclusive(t *testing.T) {
 		t.Fatalf("a request must be finalized exactly once, got %d closes", len(tcs))
 	}
 }
+
+func TestPrimaryDisconnectTriggersShutdownHook(t *testing.T) {
+	proxy := NewProxy(io.Discard, strings.NewReader(""), NewCache())
+	gone := make(chan struct{})
+	proxy.onPrimaryGone = func() { close(gone) }
+	primaryIn, primaryInWriter := io.Pipe()
+	primary := &Frontend{
+		id: 1, primary: true, scanner: bufio.NewScanner(primaryIn),
+		writer: io.Discard, done: make(chan struct{}),
+	}
+	proxy.AddFrontend(primary)
+
+	select {
+	case <-gone:
+		t.Fatal("shutdown hook fired while the primary was still connected")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// The owning editor died: its end of our stdin closes.
+	primaryInWriter.Close()
+
+	select {
+	case <-gone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("primary hit EOF but the shutdown hook never fired; the agent would be orphaned")
+	}
+}
+
+func TestSecondaryDisconnectDoesNotTriggerShutdownHook(t *testing.T) {
+	proxy := NewProxy(io.Discard, strings.NewReader(""), NewCache())
+	gone := make(chan struct{})
+	proxy.onPrimaryGone = func() { close(gone) }
+	secondary := &Frontend{
+		id: 2, primary: false, scanner: bufio.NewScanner(strings.NewReader("")),
+		writer: io.Discard, done: make(chan struct{}),
+	}
+	proxy.AddFrontend(secondary)
+
+	select {
+	case <-secondary.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("secondary never disconnected")
+	}
+	select {
+	case <-gone:
+		t.Fatal("a phone disconnecting must not shut the agent down")
+	case <-time.After(100 * time.Millisecond):
+	}
+}

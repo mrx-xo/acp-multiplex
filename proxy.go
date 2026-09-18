@@ -54,6 +54,11 @@ type Proxy struct {
 	// Socket path for mtime updates (optional)
 	sockPath  string
 	lastTouch atomic.Int64 // unix timestamp of last touch
+
+	// onPrimaryGone runs once the primary frontend disconnects (optional).
+	// The primary is the editor that spawned us; when it dies without
+	// signalling (crash, kill -9) its EOF is the only notice we get.
+	onPrimaryGone func()
 }
 
 func NewProxy(agentIn io.Writer, agentOut io.Reader, cache *Cache) *Proxy {
@@ -103,6 +108,9 @@ func (p *Proxy) AddFrontend(f *Frontend) {
 	go func() {
 		<-f.done
 		p.RemoveFrontend(f)
+		if f.primary && p.onPrimaryGone != nil {
+			p.onPrimaryGone()
+		}
 	}()
 
 	// Replay cached history for non-primary frontends.
