@@ -537,7 +537,9 @@ func (p *Proxy) handleFrontendRequest(f *Frontend, env *Envelope, line []byte) {
 	// Synthesize user_message_chunk notifications for session/prompt
 	// so all frontends (and the replay cache) see what was typed.
 	// Skip the sender — their UI already shows the user's input.
-	if env.Method == "session/prompt" {
+	// A _session/steering request is the same thing injected into the
+	// running turn; the agent swallows its echo, so synthesize it too.
+	if env.Method == "session/prompt" || env.Method == steeringMethod {
 		p.synthesizeUserMessage(env, f)
 	}
 
@@ -556,6 +558,37 @@ func (p *Proxy) handleFrontendRequest(f *Frontend, env *Envelope, line []byte) {
 	}
 }
 
+// steeringMethod is the ACP steering extension request (agent-shell,
+// claude-agent-acp, codex-acp): a prompt handed to the turn already running.
+const steeringMethod = "_session/steering"
+
+// steerTag prefixes synthesized steer text so other frontends can tell a
+// steer from a queued prompt. Mirrors agent-shell's own "[steer] " label.
+const steerTag = "[steer] "
+
+// tagSteerBlock returns BLOCK with steerTag prepended to its text when it is
+// a text content block; other block types pass through unchanged.
+func tagSteerBlock(block json.RawMessage) json.RawMessage {
+	var content map[string]json.RawMessage
+	if err := json.Unmarshal(block, &content); err != nil {
+		return block
+	}
+	var text string
+	if raw, ok := content["text"]; !ok || json.Unmarshal(raw, &text) != nil {
+		return block
+	}
+	tagged, err := json.Marshal(steerTag + text)
+	if err != nil {
+		return block
+	}
+	content["text"] = tagged
+	out, err := json.Marshal(content)
+	if err != nil {
+		return block
+	}
+	return out
+}
+
 // synthesizeUserMessage extracts prompt content blocks from a session/prompt
 // request and broadcasts them as user_message_chunk notifications to all
 // frontends except the sender (whose UI already shows the input), and into
@@ -571,6 +604,9 @@ func (p *Proxy) synthesizeUserMessage(env *Envelope, sender *Frontend) {
 	}
 
 	for _, block := range params.Prompt {
+		if env.Method == steeringMethod {
+			block = tagSteerBlock(block)
+		}
 		notif := map[string]interface{}{
 			"jsonrpc": "2.0",
 			"method":  "session/update",

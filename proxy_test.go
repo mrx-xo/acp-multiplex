@@ -1649,3 +1649,48 @@ func TestSecondaryDisconnectDoesNotTriggerShutdownHook(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 }
+
+// A _session/steering request is a user prompt injected into the running
+// turn. The agent never echoes it, so the multiplex must synthesize the
+// user_message_chunk itself, tagged so other frontends can tell a steer
+// from a queued prompt.
+func TestSteeringSynthesizesTaggedUserMessage(t *testing.T) {
+	cache := NewCache()
+	proxy := NewProxy(io.Discard, strings.NewReader(""), cache)
+	sender := &Frontend{id: 1, primary: true, writer: io.Discard, done: make(chan struct{})}
+	other := &recordingWriter{}
+	proxy.frontends = append(proxy.frontends, sender, &Frontend{id: 2, writer: other, done: make(chan struct{})})
+
+	env := &Envelope{
+		Method: "_session/steering",
+		Params: json.RawMessage(`{"sessionId":"s1","prompt":[{"type":"text","text":"stop, use rg"}]}`),
+	}
+	proxy.synthesizeUserMessage(env, sender)
+
+	snap := cache.Snapshot()
+	if len(snap) != 1 {
+		t.Fatalf("cache has %d updates, want 1", len(snap))
+	}
+	var got struct {
+		Params struct {
+			Update struct {
+				SessionUpdate string `json:"sessionUpdate"`
+				Content       struct {
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"update"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(snap[0], &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Params.Update.SessionUpdate != "user_message_chunk" {
+		t.Fatalf("sessionUpdate = %q", got.Params.Update.SessionUpdate)
+	}
+	if got.Params.Update.Content.Text != "[steer] stop, use rg" {
+		t.Fatalf("text = %q, want steer tag", got.Params.Update.Content.Text)
+	}
+	if !bytes.Contains(bytes.Join(other.snapshotLines(), nil), []byte("[steer] stop, use rg")) {
+		t.Fatal("other frontend did not receive the synthesized steer")
+	}
+}
