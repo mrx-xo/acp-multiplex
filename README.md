@@ -163,6 +163,36 @@ go test -v -run TestProxy
 python3 scripts/test_e2e.py
 ```
 
+### Faking a phone frontend
+
+Two scripts drive a live session from the socket, standing in for
+acp-mobile. Useful on a box with no phone attached (the MrX2 Emacs sandbox)
+or to verify the multiplex without the browser. Both attach as a secondary
+frontend, so the primary (the Emacs buffer) sees everything as if the phone
+had sent it.
+
+```bash
+# Find the socket of the session you want (one per acp-multiplex process).
+ls "${XDG_RUNTIME_DIR:-$TMPDIR}/acp-multiplex/"
+
+# Send one prompt as the phone; prints the streamed reply for up to 60 s.
+python3 scripts/fake-phone.py "$TMPDIR/acp-multiplex/<pid>.sock" "your prompt" 60
+
+# Listen only: log every user/agent chunk and turn_complete for 70 s.
+# Run this in the background, then steer from Emacs (M-RET) to confirm the
+# synthesized "[steer] ..." user chunk reaches secondaries.
+python3 scripts/fake-phone-listen.py "$TMPDIR/acp-multiplex/<pid>.sock" 70
+```
+
+`fake-phone.py` reads the session id from the replay snapshot the proxy
+sends on attach, so it needs a session that already ran `session/new`.
+On macOS the daemon's `$TMPDIR` is the one that matters; read it with
+`emacsclient --eval '(getenv "TMPDIR")'` when the shell's differs.
+
+Verified 2026-09-23 against agent-shell 0.78.2: a faked phone prompt renders
+in the Emacs buffer under the persistent prompt, and a desktop steer reaches
+the listener as `[steer] ...`.
+
 ## Architecture
 
 | File | Purpose |
