@@ -197,7 +197,7 @@ func cleanStaleSockets() {
 		if err != nil {
 			continue
 		}
-		if err := syscall.Kill(pid, 0); err != nil {
+		if !processAlive(pid) {
 			os.Remove(filepath.Join(dir, name))
 		}
 	}
