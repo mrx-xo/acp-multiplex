@@ -1694,3 +1694,58 @@ func TestSteeringSynthesizesTaggedUserMessage(t *testing.T) {
 		t.Fatal("other frontend did not receive the synthesized steer")
 	}
 }
+
+func restoreEnvelope(t *testing.T, id int, method, session string) (*Envelope, []byte) {
+	t.Helper()
+	line := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":%q,"params":{"sessionId":%q,"cwd":"/tmp","mcpServers":[]}}`, id, method, session))
+	env, err := parseEnvelope(line)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return env, line
+}
+
+// A loaded session's history arrives as user and agent chunks with no turn
+// boundary.  Without a closing marker a late joiner reads the last
+// historical prompt as a turn that is still running.
+func TestLoadedHistoryIsClosedForLateJoiners(t *testing.T) {
+	for _, method := range []string{"session/load", "session/resume"} {
+		t.Run(method, func(t *testing.T) {
+			proxy, sender, observer := turnTestProxy(t)
+			env, line := restoreEnvelope(t, 3, method, "s1")
+			proxy.handleFrontendRequest(sender, env, line)
+			proxyID := proxy.nextID.Load() - 1
+			proxy.cache.AddUpdate([]byte(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"old prompt"}}}}`))
+			proxy.cache.AddUpdate([]byte(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"old answer"}}}}`))
+			renv, rline := responseEnvelope(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":{}}`, proxyID))
+			proxy.routeResponseToFrontend(renv, rline)
+
+			cached := proxy.cache.Snapshot()
+			tcs := turnCompletes(cached)
+			if len(tcs) != 1 || tcs[0]["sessionId"] != "s1" || tcs[0]["stopReason"] != "history" {
+				t.Fatalf("cache must close the loaded history once, for the request's session, got %v", tcs)
+			}
+			if last := turnCompletes(cached[len(cached)-1:]); len(last) != 1 {
+				t.Fatalf("the marker must follow the history, cache ends with %s", cached[len(cached)-1])
+			}
+			if got := turnCompletes(observer.snapshotLines()); len(got) != 1 {
+				t.Fatalf("an attached observer must see the marker too, got %d", len(got))
+			}
+			if got := turnCompletes(sender.writer.(*recordingWriter).snapshotLines()); len(got) != 0 {
+				t.Fatalf("the requester has its own response and must not get the marker, got %d", len(got))
+			}
+		})
+	}
+}
+
+func TestFailedLoadAddsNoTurnBoundary(t *testing.T) {
+	proxy, sender, _ := turnTestProxy(t)
+	env, line := restoreEnvelope(t, 3, "session/load", "s1")
+	proxy.handleFrontendRequest(sender, env, line)
+	proxyID := proxy.nextID.Load() - 1
+	renv, rline := responseEnvelope(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"error":{"code":-32000,"message":"no such session"}}`, proxyID))
+	proxy.routeResponseToFrontend(renv, rline)
+	if got := turnCompletes(proxy.cache.Snapshot()); len(got) != 0 {
+		t.Fatalf("a failed load restored nothing to close, got %v", got)
+	}
+}

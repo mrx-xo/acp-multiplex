@@ -396,7 +396,7 @@ func (p *Proxy) routeResponseToFrontend(env *Envelope, line []byte) {
 	if Debug {
 		log.Printf("send to frontend %d: %.100s", pr.frontend.id, string(rewritten))
 	}
-	orderedBoundary := replayResponse != nil || pr.method == "session/prompt" || pr.method == "session/set_mode"
+	orderedBoundary := replayResponse != nil || pr.method == "session/prompt" || pr.method == "session/set_mode" || restoresHistory(pr.method)
 	if orderedBoundary {
 		// Keep the direct response and its cached setup/turn boundary atomic
 		// with respect to the requester's immediately following request.
@@ -421,6 +421,9 @@ func (p *Proxy) routeResponseToFrontend(env *Envelope, line []byte) {
 	}
 	if pr.method == "session/set_mode" {
 		p.synthesizeModeChangeLocked(pr)
+	}
+	if restoresHistory(pr.method) {
+		p.closeRestoredHistoryLocked(pr, line)
 	}
 }
 
@@ -517,7 +520,7 @@ func (p *Proxy) handleFrontendRequest(f *Frontend, env *Envelope, line []byte) {
 		method:     env.Method,
 		params:     env.Params,
 	}
-	if env.Method == "session/prompt" {
+	if env.Method == "session/prompt" || restoresHistory(env.Method) {
 		var params struct {
 			SessionID string `json:"sessionId"`
 		}
@@ -659,6 +662,45 @@ func (p *Proxy) otherPromptPending(sessionID string) bool {
 		return true
 	})
 	return found
+}
+
+// restoresHistory reports whether method makes the agent replay a stored
+// session's history as session/update notifications.
+func restoresHistory(method string) bool {
+	return method == "session/load" || method == "session/resume"
+}
+
+// closeRestoredHistoryLocked caches a turn_complete after a successful
+// session/load or session/resume.  The agent replays history as user and
+// agent chunks with no turn boundary, so a late joiner would otherwise read
+// the last historical prompt as a turn still running.  stopReason "history"
+// tells it apart from a real turn's end.  Requires replayOrderMu to be held.
+func (p *Proxy) closeRestoredHistoryLocked(pr *PendingRequest, responseLine []byte) {
+	var resp struct {
+		Error *json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(responseLine, &resp) != nil || resp.Error != nil {
+		return
+	}
+	if p.otherPromptPending(pr.sessionID) {
+		return
+	}
+	line, err := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "session/update",
+		"params": map[string]interface{}{
+			"sessionId": pr.sessionID,
+			"update": map[string]interface{}{
+				"sessionUpdate": "turn_complete",
+				"stopReason":    "history",
+			},
+		},
+	})
+	if err != nil {
+		log.Printf("close restored history: marshal: %v", err)
+		return
+	}
+	p.cacheAndBroadcastLocked(line, pr.frontend)
 }
 
 // synthesizeTurnCompleteLocked requires replayOrderMu to be held.
